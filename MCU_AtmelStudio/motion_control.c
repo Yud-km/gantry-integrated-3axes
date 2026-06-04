@@ -168,6 +168,18 @@ static uint8_t auto_route_pos = 0;
 static uint8_t auto_current_cell = CELL_HOME;
 static uint8_t path_configured = 0;
 
+/*
+ * route_update_busy = 1 nghĩa là WinForms đang gửi một bộ dữ liệu quỹ đạo mới.
+ * MCU sẽ không cho AUTO_WAIT_OBJECT bắt đầu chu trình cho đến khi nhận APPLYROUTE.
+ *
+ * Thứ tự đúng từ WinForms:
+ *   ROUTE <name>
+ *   CELL ...
+ *   PATH ...
+ *   APPLYROUTE
+ */
+static uint8_t route_update_busy = 0;
+
 static char current_route_name[12] = "Default";
 
 static float z_pick_limit_pos_mm = 0.0f;
@@ -188,6 +200,7 @@ static void report_status(void);
 static void report_limits(void);
 static void report_one_cell(uint8_t idx);
 static void lcd_update(void);
+static void auto_build_route(void);
 
 /* Store constant UART text in FLASH to save ATmega328P SRAM. */
 static void serial_write_pgm(const char *p)
@@ -363,6 +376,22 @@ static void stop_motion(void)
     current_dir = 0;
 }
 
+/*
+ * Sau khi AUTO chạy xong 1 chu trình, auto_enabled vẫn có thể = 1 để chờ vật.
+ * Nếu người dùng Jog/GOTO thủ công thì phải hủy trạng thái chờ Auto này,
+ * nếu không auto_process() sẽ kéo máy về HOME.
+ */
+static void cancel_auto_waiting_for_manual(void)
+{
+    if (auto_enabled) {
+        auto_enabled = 0;
+        auto_phase = AUTO_IDLE;
+        auto_route_pos = 0;
+        auto_route_count = 0;
+        route_update_busy = 0;
+    }
+}
+
 static uint8_t limit_x_active(void)
 {
     return limits_x_min();
@@ -534,6 +563,11 @@ static uint8_t start_jog_axis(uint8_t axis, int8_t dir)
     } else if (axis == Z_AXIS) {
         p[Z_AXIS] += (dir > 0) ? manual_step_mm : -manual_step_mm;
     }
+
+    /*
+     * Jog thủ công hủy chế độ AUTO đang chờ vật.
+     */
+    cancel_auto_waiting_for_manual();
 
     run_mode = MODE_JOG;
 
@@ -920,6 +954,14 @@ static void command_set_path(char *line)
 
     path_configured = 1;
 
+    /*
+     * Nếu không ở trong phiên cập nhật ROUTE/CELL/PATH thì cập nhật route ngay.
+     * Trường hợp WinForms mới sẽ đợi APPLYROUTE để build một lần sau cùng.
+     */
+    if (!route_update_busy && auto_enabled && auto_phase == AUTO_WAIT_OBJECT && run_mode == MODE_IDLE) {
+        auto_build_route();
+    }
+
     SWL("path:ok");
     report_one_cell(idx);
 }
@@ -928,6 +970,12 @@ static void command_set_route(char *line)
 {
     char *p = line + 5;
     uint8_t i = 0;
+
+    /*
+     * Bắt đầu nhận quỹ đạo mới từ WinForms.
+     * Khóa AUTO_WAIT_OBJECT đến khi nhận APPLYROUTE.
+     */
+    route_update_busy = 1;
 
     p = skip_spaces(p);
 
@@ -948,6 +996,32 @@ static void command_set_route(char *line)
 
     SW("route:ok:");
     serial_write_ln(current_route_name);
+    report_status();
+}
+
+static void command_apply_route(void)
+{
+    if (run_mode == MODE_AUTO || run_mode == MODE_HOMING || st_is_running()) {
+        SWL("error:busy");
+        return;
+    }
+
+    /*
+     * Đã nhận xong ROUTE/CELL/PATH.
+     * Build lại auto_route ngay tại đây để chu trình tiếp theo dùng đúng dữ liệu mới.
+     */
+    path_configured = 1;
+    auto_build_route();
+    auto_route_pos = 0;
+
+    if (auto_phase == AUTO_WAIT_OBJECT) {
+        auto_current_cell = CELL_HOME;
+    }
+
+    route_update_busy = 0;
+
+    SWL("route:applied");
+    report_all_cells();
     report_status();
 }
 
@@ -1343,10 +1417,11 @@ static void auto_start(void)
     }
 
     /*
-     * Build route here.
-     * If no path is set, default = 1 -> 2 -> 3 -> 4 -> END.
+     * START AUTO chỉ chạy với dữ liệu hiện có trong MCU.
+     * Việc cập nhật tọa độ/quỹ đạo đã do nút APPLY QUỸ ĐẠO xử lý trước đó.
      */
     auto_build_route();
+    route_update_busy = 0;
 
     auto_enabled = 1;
     auto_phase = AUTO_WAIT_OBJECT;
@@ -1558,6 +1633,15 @@ static void auto_process(void)
             /*
              * AUTO only starts one cycle when crane is idle at HOME and sensor sees object.
              */
+
+            /*
+             * Đang nhận quỹ đạo mới thì không cho bắt đầu chu trình.
+             * Đợi APPLYROUTE để đảm bảo CELL/PATH đã cập nhật xong.
+             */
+            if (route_update_busy) {
+                return;
+            }
+
             auto_current_cell = CELL_HOME;
 
             if (!position_close(cells[CELL_HOME].x, cells[CELL_HOME].y, cells[CELL_HOME].z, POS_TOL_MM)) {
@@ -1838,6 +1922,11 @@ static void command_goto(char *line)
     parse_word_float(line, 'Z', &z);
     parse_word_float(line, 'F', &f);
 
+    /*
+     * GOTO thủ công hủy chế độ AUTO đang chờ vật.
+     */
+    cancel_auto_waiting_for_manual();
+
     run_mode = MODE_JOG;
     r = start_motion_abs(x, y, z, f, AXIS_NONE, 0, 1);
 
@@ -1873,6 +1962,11 @@ static void command_jogi(char *line)
     parse_word_float(line, 'Y', &dy);
     parse_word_float(line, 'Z', &dz);
     parse_word_float(line, 'F', &f);
+
+    /*
+     * JOGI thủ công hủy chế độ AUTO đang chờ vật.
+     */
+    cancel_auto_waiting_for_manual();
 
     run_mode = MODE_JOG;
     r = start_motion_abs(
@@ -1930,6 +2024,11 @@ static void process_command(char *line)
 
     if (starts_with(line, "PATH ")) {
         command_set_path(line);
+        return;
+    }
+
+    if (starts_with(line, "APPLYROUTE")) {
+        command_apply_route();
         return;
     }
 
