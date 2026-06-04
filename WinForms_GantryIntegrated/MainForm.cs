@@ -114,6 +114,8 @@ namespace GantryCraneIntegrated
         private double currentZ = 0.0;
 
         private bool autoRunning = false;
+        private bool routeApplyPending = false;
+        private bool mcuHomed = false;
         private string machineState = "Disconnected";
         private string lastAlarmMessage = "";
 
@@ -166,7 +168,7 @@ namespace GantryCraneIntegrated
             cells.AddRange(CreateDefaultCells());
         }
 
-        private List<CraneCell> CreateDefaultCells()
+        private List<CraneCell> CreateBuiltInDefaultCells()
         {
             return new List<CraneCell>
             {
@@ -177,6 +179,22 @@ namespace GantryCraneIntegrated
                 new CraneCell("4", "4", 135, 270, 0, mandatory: false, selectedPath: true),
                 new CraneCell("END", "END", 0, 270, 0, mandatory: true, selectedPath: true)
             };
+        }
+
+        private List<CraneCell> CreateDefaultCells()
+        {
+            /*
+             * Default ban đầu là tọa độ cố định trong code.
+             * Nếu người dùng đã APPLY khi ComboBox đang chọn Default,
+             * chương trình sẽ lưu Default.txt và nạp lại vào trajectoryProfiles.
+             * Khi đó Default sẽ lấy dữ liệu đã lưu thay vì hard-code ban đầu.
+             */
+            if (trajectoryProfiles.TryGetValue(NoTrajectoryText, out List<CraneCell> savedDefault))
+            {
+                return CloneCells(savedDefault);
+            }
+
+            return CreateBuiltInDefaultCells();
         }
 
         private List<CraneCell> CloneCells(IEnumerable<CraneCell> source)
@@ -295,7 +313,7 @@ namespace GantryCraneIntegrated
             var layout = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                ColumnCount = 11,
+                ColumnCount = 10,
                 RowCount = 1
             };
 
@@ -309,7 +327,6 @@ namespace GantryCraneIntegrated
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 60));   // Route label
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));  // Route combobox
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));   // dư
-            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
 
             layout.Controls.Add(TextLabel("COM:"), 0, 0);
 
@@ -361,7 +378,7 @@ namespace GantryCraneIntegrated
             };
 
             btnReadCells.Click += (_, _) => SendCommand("CELLS");
-            layout.Controls.Add(btnReadCells, 10, 0);
+            layout.Controls.Add(btnReadCells, 9, 0);
 
             box.Controls.Add(layout);
             return box;
@@ -433,17 +450,48 @@ namespace GantryCraneIntegrated
 
             if (!serial.IsOpen)
             {
+                routeApplyPending = false;
                 Log("Route selected locally: " + selectedName);
                 return;
             }
 
             /*
-             * Send route name + CELL/PATH immediately when ComboBox changes.
-             * START AUTO only sends AUTO later.
+             * Chưa CHECK HOME thì chỉ cập nhật trên WinForms, chưa gửi xuống MCU.
+             * Sau khi MCU báo home:ok thì mới gửi ROUTE/CELL/PATH/APPLYROUTE.
              */
+            if (!mcuHomed)
+            {
+                routeApplyPending = false;
+                Log("Route selected locally. MCU not homed yet, wait CHECK HOME: " + selectedName);
+                return;
+            }
+
+            /*
+             * Khi chọn quỹ đạo trong ComboBox cũng gửi ROUTE/CELL/PATH/APPLYROUTE ngay.
+             */
+            routeApplyPending = true;
             QueueCommands(BuildRouteCommands(selectedName, selectedCells));
 
             Log("Route sent to Arduino: " + selectedName);
+        }
+
+        private void StartAutoWithCurrentTrajectory()
+        {
+            /*
+             * Hàm cũ giữ lại để tránh lỗi tham chiếu.
+             * Logic mới: START AUTO chỉ gửi AUTO.
+             */
+            if (routeApplyPending || commandQueue.Count > 0)
+            {
+                MessageBox.Show(
+                    "Quỹ đạo đang được gửi xuống vi điều khiển. Hãy đợi RX< route:applied rồi START AUTO.",
+                    "Đợi cập nhật quỹ đạo",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            SendCommand("AUTO");
         }
 
         private List<string> BuildRouteCommands(string routeName, IEnumerable<CraneCell> routeCells)
@@ -464,6 +512,12 @@ namespace GantryCraneIntegrated
                     commands.Add($"PATH {cell.CommandName} {(cell.SelectedPath ? "ON" : "OFF")}");
                 }
             }
+
+            /*
+             * Lệnh cuối báo cho MCU biết đã gửi đủ ROUTE/CELL/PATH.
+             * MCU chỉ build lại auto_route sau lệnh này.
+             */
+            commands.Add("APPLYROUTE");
 
             return commands;
         }
@@ -638,7 +692,20 @@ namespace GantryCraneIntegrated
             var btnAuto = ActionButton("START AUTO", Color.SeaGreen);
             btnAuto.Click += (_, _) =>
             {
-                /* Route is applied immediately when ComboBox changes. */
+                /*
+                 * START AUTO chỉ chạy.
+                 * Việc cập nhật tọa độ/quỹ đạo phải thực hiện bằng nút APPLY QUỸ ĐẠO trước đó.
+                 */
+                if (routeApplyPending || commandQueue.Count > 0)
+                {
+                    MessageBox.Show(
+                        "Quỹ đạo đang được gửi xuống vi điều khiển. Hãy đợi RX< route:applied rồi START AUTO.",
+                        "Đợi cập nhật quỹ đạo",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
                 SendCommand("AUTO");
             };
 
@@ -739,11 +806,11 @@ namespace GantryCraneIntegrated
             {
                 Dock = DockStyle.Top,
                 ColumnCount = 1,
-                RowCount = 8,
-                Height = 360
+                RowCount = 9,
+                Height = 410
             };
 
-            for (int i = 0; i < 8; i++)
+            for (int i = 0; i < 9; i++)
             {
                 actions.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             }
@@ -758,6 +825,9 @@ namespace GantryCraneIntegrated
 
             var btnAdd = ActionButton("ADD", Color.SeaGreen);
             btnAdd.Click += (_, _) => SaveCurrentTrajectoryDraft();
+
+            var btnDelete = ActionButton("DELETE SELECTED ROUTE", Color.Firebrick);
+            btnDelete.Click += (_, _) => DeleteSelectedTrajectory();
 
             var btnResetDraft = new Button
             {
@@ -774,7 +844,7 @@ namespace GantryCraneIntegrated
             {
                 Text =
                     "Cách dùng: CREATE đặt tên → chuột phải vào ô để set tọa độ/quỹ đạo → ADD để lưu file .txt. " +
-                    "Nếu không set lại, quỹ đạo sẽ dùng tọa độ mặc định.",
+                    "Chọn quỹ đạo trên ComboBox rồi DELETE để xóa quỹ đạo và file .txt. Default không xóa được.",
                 Dock = DockStyle.Fill,
                 ForeColor = Color.DimGray,
                 TextAlign = ContentAlignment.TopLeft
@@ -783,8 +853,9 @@ namespace GantryCraneIntegrated
             actions.Controls.Add(lblSettingRouteName, 0, 0);
             actions.Controls.Add(btnCreate, 0, 1);
             actions.Controls.Add(btnAdd, 0, 2);
-            actions.Controls.Add(btnResetDraft, 0, 3);
-            actions.Controls.Add(note, 0, 4);
+            actions.Controls.Add(btnDelete, 0, 3);
+            actions.Controls.Add(btnResetDraft, 0, 4);
+            actions.Controls.Add(note, 0, 5);
             actions.SetRowSpan(note, 3);
 
             actionBox.Controls.Add(actions);
@@ -967,6 +1038,97 @@ namespace GantryCraneIntegrated
             }
         }
 
+        private void ApplyCurrentCellsToSelectedTrajectory()
+        {
+            string selectedName = cboTrajectory.SelectedItem as string;
+
+            if (string.IsNullOrWhiteSpace(selectedName))
+            {
+                selectedName = NoTrajectoryText;
+            }
+
+            /*
+             * Chỉ cho APPLY khi máy rảnh. Nếu máy đang Auto/Home/Homing/Jog
+             * thì không cập nhật quỹ đạo để tránh thay đổi dữ liệu giữa lúc chạy.
+             */
+            if (serial.IsOpen &&
+                (autoRunning ||
+                 machineState.Equals("Auto", StringComparison.OrdinalIgnoreCase) ||
+                 machineState.Equals("Home", StringComparison.OrdinalIgnoreCase) ||
+                 machineState.Equals("Homing", StringComparison.OrdinalIgnoreCase) ||
+                 machineState.Equals("Jog", StringComparison.OrdinalIgnoreCase)))
+            {
+                MessageBox.Show(
+                    "Máy đang chạy. Chỉ APPLY quỹ đạo khi State = Idle.",
+                    "Không thể APPLY",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            List<CraneCell> updatedCells = CloneCells(cells);
+
+            /*
+             * HOME và END luôn bắt buộc. Dòng này bảo vệ dữ liệu nếu người dùng
+             * hoặc file text sửa nhầm selectedPath của HOME/END.
+             */
+            foreach (var cell in updatedCells)
+            {
+                if (cell.Mandatory)
+                {
+                    cell.SelectedPath = true;
+                }
+            }
+
+            try
+            {
+                /*
+                 * Nếu ComboBox đang là Default thì vẫn cho lưu Default.txt.
+                 * Lần sau chọn Default hoặc khởi động lại app, Default sẽ lấy
+                 * tọa độ/quỹ đạo đã APPLY thay vì dùng mặc định hard-code.
+                 */
+                trajectoryProfiles[selectedName] = CloneCells(updatedCells);
+                SaveTrajectoryToFile(selectedName, updatedCells);
+
+                string oldSelected = selectedName;
+                RefreshTrajectoryCombo();
+                cboTrajectory.SelectedItem = oldSelected;
+
+                /*
+                 * Gửi lại ROUTE + CELL + PATH + APPLYROUTE xuống Arduino ngay nếu đang kết nối.
+                 * Khi MCU trả về route:applied thì routeApplyPending sẽ được xóa.
+                 */
+                if (serial.IsOpen)
+                {
+                    routeApplyPending = true;
+                    QueueCommands(BuildRouteCommands(selectedName, updatedCells));
+                    Log("Route applying to MCU: " + selectedName);
+                }
+                else
+                {
+                    Log("Route applied locally: " + selectedName);
+                }
+
+                UpdateCellViews();
+
+                MessageBox.Show(
+                    serial.IsOpen
+                        ? "Đã lưu file và đang gửi quỹ đạo xuống vi điều khiển. Hãy đợi log RX< route:applied rồi START AUTO."
+                        : "Đã APPLY và lưu quỹ đạo: " + selectedName,
+                    "APPLY OK",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    "Không thể APPLY quỹ đạo.\n" + ex.Message,
+                    "APPLY ERROR",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
         private void SaveCurrentTrajectoryDraft()
         {
             if (string.IsNullOrWhiteSpace(currentSettingTrajectoryName))
@@ -987,6 +1149,82 @@ namespace GantryCraneIntegrated
                 "ADD OK",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
+        }
+
+        private void DeleteSelectedTrajectory()
+        {
+            string selectedName = cboTrajectory.SelectedItem as string;
+
+            if (string.IsNullOrWhiteSpace(selectedName))
+            {
+                MessageBox.Show("Chưa chọn quỹ đạo để xóa.", "DELETE",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (selectedName.Equals(NoTrajectoryText, StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show("Không được xóa quỹ đạo Default.", "DELETE",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (!trajectoryProfiles.ContainsKey(selectedName))
+            {
+                MessageBox.Show("Không tìm thấy quỹ đạo: " + selectedName, "DELETE",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            DialogResult confirm = MessageBox.Show(
+                "Bạn có chắc muốn xóa quỹ đạo '" + selectedName + "' không?\n" +
+                "File .txt của quỹ đạo này cũng sẽ bị xóa.",
+                "Xác nhận xóa quỹ đạo",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+
+            try
+            {
+                string filePath = GetTrajectoryFilePath(selectedName);
+
+                trajectoryProfiles.Remove(selectedName);
+
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
+                }
+
+                if (currentSettingTrajectoryName.Equals(selectedName, StringComparison.OrdinalIgnoreCase))
+                {
+                    currentSettingTrajectoryName = "";
+                    lblSettingRouteName.Text = "Chưa tạo tên quỹ đạo";
+                    ResetSettingCellsToDefaults();
+                    UpdateSettingCellViews();
+                }
+
+                /* Sau khi xóa, quay về Default để tránh ComboBox còn chọn quỹ đạo không tồn tại. */
+                RefreshTrajectoryCombo();
+                cboTrajectory.SelectedItem = NoTrajectoryText;
+
+                MessageBox.Show(
+                    "Đã xóa quỹ đạo: " + selectedName,
+                    "DELETE OK",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    "Không thể xóa quỹ đạo.\n" + ex.Message,
+                    "DELETE ERROR",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
         }
 
         private Panel BuildJogPanel()
@@ -1021,22 +1259,24 @@ namespace GantryCraneIntegrated
             var right = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                RowCount = 5,
+                RowCount = 6,
                 ColumnCount = 1,
                 AutoScroll = true
             };
 
             right.RowStyles.Add(new RowStyle(SizeType.Absolute, 112));
             right.RowStyles.Add(new RowStyle(SizeType.Absolute, 128));
+            right.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
             right.RowStyles.Add(new RowStyle(SizeType.Absolute, 185));
             right.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
             right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
             right.Controls.Add(BuildGotoPanel(), 0, 0);
             right.Controls.Add(BuildJogSettingsPanel(), 0, 1);
-            right.Controls.Add(BuildJogButtonsPanel(), 0, 2);
-            right.Controls.Add(BuildRelayPanel(), 0, 3);
-            right.Controls.Add(BuildRawPanel(), 0, 4);
+            right.Controls.Add(BuildApplyTrajectoryPanel(), 0, 2);
+            right.Controls.Add(BuildJogButtonsPanel(), 0, 3);
+            right.Controls.Add(BuildRelayPanel(), 0, 4);
+            right.Controls.Add(BuildRawPanel(), 0, 5);
 
             root.Controls.Add(right, 1, 0);
 
@@ -1305,6 +1545,31 @@ namespace GantryCraneIntegrated
             layout.SetColumnSpan(btnApply, 1);
 
             box.Controls.Add(layout);
+            return box;
+        }
+
+        private GroupBox BuildApplyTrajectoryPanel()
+        {
+            var box = new GroupBox
+            {
+                Text = "Áp dụng quỹ đạo đang sửa",
+                Dock = DockStyle.Fill,
+                Padding = new Padding(8)
+            };
+
+            var layout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 1
+            };
+
+            var btnApplyRoute = ActionButton("APPLY QUỸ ĐẠO", Color.DarkOrange);
+            btnApplyRoute.Click += (_, _) => ApplyCurrentCellsToSelectedTrajectory();
+
+            layout.Controls.Add(btnApplyRoute, 0, 0);
+            box.Controls.Add(layout);
+
             return box;
         }
 
@@ -1744,7 +2009,15 @@ namespace GantryCraneIntegrated
 
             foreach (string name in trajectoryProfiles.Keys)
             {
-                cboTrajectory.Items.Add(name);
+                /*
+                 * Default đã được add cố định ở trên.
+                 * Nếu có Default.txt thì vẫn lưu trong trajectoryProfiles,
+                 * nhưng không add lần 2 vào ComboBox.
+                 */
+                if (!name.Equals(NoTrajectoryText, StringComparison.OrdinalIgnoreCase))
+                {
+                    cboTrajectory.Items.Add(name);
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(old) && cboTrajectory.Items.Contains(old))
@@ -1873,6 +2146,8 @@ namespace GantryCraneIntegrated
                 machineState = "Disconnected";
 
                 Log("Disconnected");
+                mcuHomed = false;
+                routeApplyPending = false;
                 return;
             }
 
@@ -2009,6 +2284,13 @@ namespace GantryCraneIntegrated
                 return;
             }
 
+            if (line.Equals("route:applied", StringComparison.OrdinalIgnoreCase))
+            {
+                routeApplyPending = false;
+                Log("Route apply completed on MCU.");
+                return;
+            }
+
             if (line.Equals("auto:start", StringComparison.OrdinalIgnoreCase))
             {
                 /*
@@ -2029,8 +2311,20 @@ namespace GantryCraneIntegrated
 
             if (line.StartsWith("home:ok", StringComparison.OrdinalIgnoreCase))
             {
-                MessageBox.Show("Check home xong.", "Home OK",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                mcuHomed = true;
+                lblHomed.Text = "1";
+
+                /*
+                 * Sau khi CHECK HOME xong mới gửi quỹ đạo hiện tại xuống MCU.
+                 */
+                ApplySelectedTrajectoryNow();
+
+                MessageBox.Show(
+                    "Check home xong. Đã bắt đầu cập nhật quỹ đạo hiện tại xuống vi điều khiển.",
+                    "Home OK",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+
                 return;
             }
 
@@ -2097,7 +2391,10 @@ namespace GantryCraneIntegrated
                 }
                 else if (part.StartsWith("Homed:", StringComparison.OrdinalIgnoreCase))
                 {
-                    lblHomed.Text = part.Substring(6);
+                    string homedValue = part.Substring(6).Trim();
+
+                    lblHomed.Text = homedValue;
+                    mcuHomed = homedValue == "1";
                 }
                 else if (part.StartsWith("Sensor:", StringComparison.OrdinalIgnoreCase) ||
                          part.StartsWith("Object:", StringComparison.OrdinalIgnoreCase))
